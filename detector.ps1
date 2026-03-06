@@ -43,14 +43,33 @@
 .PARAMETER MonitorInterval
     Seconds between checks in monitor mode (default: 10).
 
+.PARAMETER AllowListFile
+    Path to a file (one tool name per line, or a JSON array) containing
+    authorized RMM tools that should be excluded from alerts.
+
+.PARAMETER AllowList
+    Comma-separated list of authorized tool names to exclude from alerts.
+    Example: -AllowList "TeamViewer,NinjaRMM"
+
+.PARAMETER EventLog
+    Write findings to the Windows Application Event Log (Source: RMMDetector,
+    Event ID 1001). Enables SIEM and log-forwarder integration.
+
+.PARAMETER Csv
+    Export results to a structured CSV file alongside the text report.
+    The CSV file uses the same base path as -OutputFile with a .csv extension.
+
 .EXAMPLE
     .\detector.ps1
     .\detector.ps1 -Silent
     .\detector.ps1 -Json
+    .\detector.ps1 -Csv
     .\detector.ps1 -OutputFile "C:\Temp\my_report.txt"
     .\detector.ps1 -Notify
     .\detector.ps1 -Monitor
     .\detector.ps1 -Monitor -MonitorInterval 5
+    .\detector.ps1 -AllowListFile "C:\Temp\approved_tools.txt"
+    .\detector.ps1 -AllowList "TeamViewer,NinjaRMM" -EventLog
 
 .NOTES
     Run as Administrator for complete results.
@@ -65,7 +84,11 @@ param(
     [string]$SignaturesFile = "",
     [switch]$Notify,
     [switch]$Monitor,
-    [int]$MonitorInterval = 10
+    [int]$MonitorInterval = 10,
+    [string]$AllowListFile = "",
+    [string]$AllowList = "",
+    [switch]$EventLog,
+    [switch]$Csv
 )
 
 Set-StrictMode -Version Latest
@@ -162,6 +185,105 @@ $KnownRegKeys      = if ($Signatures -and $Signatures.registry_keys)        { $S
 $KnownFolders      = if ($Signatures -and $Signatures.install_folders)      { $Signatures.install_folders }      else { $BuiltinFolders }
 $KnownTaskKeywords = if ($Signatures -and $Signatures.scheduled_task_keywords) { $Signatures.scheduled_task_keywords } else { $BuiltinTaskKeywords }
 $HeuristicProcs    = if ($Signatures -and $Signatures.heuristic_process_names) { $Signatures.heuristic_process_names } else { @("agent.exe","rmm-agent.exe","clientservice.exe","remoteservice.exe") }
+$RiskLevels        = if ($Signatures -and $Signatures.risk_levels)             { $Signatures.risk_levels }             else { $null }
+
+# ─── Allowlist ────────────────────────────────────────────────────────────────
+
+$ApprovedTools = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase)
+
+if (-not [string]::IsNullOrEmpty($AllowList)) {
+    foreach ($entry in ($AllowList -split ',')) {
+        $trimmed = $entry.Trim()
+        if ($trimmed) { [void]$ApprovedTools.Add($trimmed) }
+    }
+}
+
+if (-not [string]::IsNullOrEmpty($AllowListFile) -and (Test-Path $AllowListFile)) {
+    try {
+        $raw = Get-Content $AllowListFile -Raw -ErrorAction Stop
+        # Try JSON array first, then fall back to line-by-line
+        try {
+            $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+            foreach ($entry in $parsed) {
+                $trimmed = $entry.Trim()
+                if ($trimmed) { [void]$ApprovedTools.Add($trimmed) }
+            }
+        } catch {
+            foreach ($line in ($raw -split "`n")) {
+                $trimmed = $line.Trim()
+                if ($trimmed -and -not $trimmed.StartsWith('#')) {
+                    [void]$ApprovedTools.Add($trimmed)
+                }
+            }
+        }
+    } catch {}
+}
+
+# Returns $true if the finding string contains an allowlisted tool name
+function Test-Allowlisted {
+    param([string]$Item)
+    foreach ($tool in $ApprovedTools) {
+        # Use word-boundary-aware case-insensitive match to avoid partial matches
+        # e.g. 'Desk' should not match 'RemotePC Desktop'
+        if ($Item -imatch "(?<![A-Za-z0-9])$([regex]::Escape($tool))(?![A-Za-z0-9])") { return $true }
+    }
+    return $false
+}
+
+# ─── Risk Scoring ─────────────────────────────────────────────────────────────
+
+# Returns a risk label (Critical / High / Medium / Low) for a finding.
+# Runtime context (active network connection) elevates risk to Critical.
+# Otherwise the vendor-level base risk from signatures.json is used.
+function Get-RiskLevel {
+    param(
+        [string]$Item,
+        [string]$DetectionType   # Process | Service | Software | Startup | Task | Network | Directory
+    )
+
+    # Active network connection is always Critical
+    if ($DetectionType -eq 'Network' -and $Item -match 'ESTABLISHED') {
+        return 'Critical'
+    }
+
+    # Look up per-vendor base risk from signatures
+    if ($RiskLevels) {
+        foreach ($vendor in ($RiskLevels | Get-Member -MemberType NoteProperty | Select-Object -ExpandProperty Name)) {
+            if ($Item -match [regex]::Escape($vendor)) {
+                $base = $RiskLevels.$vendor
+                # Running process or service of a known-risky tool → elevate to High minimum
+                if ($DetectionType -in @('Process','Service') -and $base -eq 'Low') {
+                    return 'Medium'
+                }
+                return $base
+            }
+        }
+    }
+
+    # Default by detection type when no vendor match
+    switch ($DetectionType) {
+        'Process'   { return 'High'   }
+        'Service'   { return 'Medium' }
+        'Software'  { return 'Medium' }
+        'Startup'   { return 'Medium' }
+        'Task'      { return 'Low'    }
+        'Network'   { return 'High'   }
+        'Directory' { return 'Low'    }
+        default     { return 'Low'    }
+    }
+}
+
+function Get-RiskColor {
+    param([string]$Risk)
+    switch ($Risk) {
+        'Critical' { return 'Red'     }
+        'High'     { return 'Yellow'  }
+        'Medium'   { return 'Cyan'    }
+        'Low'      { return 'Gray'    }
+        default    { return 'White'   }
+    }
+}
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -173,9 +295,10 @@ function Write-Status {
 }
 
 function Write-Finding {
-    param([string]$Category, [string]$Item)
+    param([string]$Category, [string]$Item, [string]$Risk = 'Medium')
     if (-not $Json) {
-        Write-Host "[FOUND] $Item" -ForegroundColor Yellow
+        $color = Get-RiskColor $Risk
+        Write-Host "[FOUND] [$Risk] $Item" -ForegroundColor $color
     }
 }
 
@@ -240,6 +363,44 @@ function Send-WindowsNotification {
     }
 }
 
+# ─── Event Log ────────────────────────────────────────────────────────────────
+
+function Send-EventLogEntry {
+    <#
+    .SYNOPSIS
+        Write a finding to the Windows Application Event Log.
+        Event ID 1001 = finding detected; 1000 = scan summary.
+        Requires that the calling process has permission to create event sources.
+        Falls back to a console warning if the write fails.
+    #>
+    param(
+        [string]$Message,
+        [string]$EntryType = 'Warning',   # Information | Warning | Error
+        [int]$EventId = 1001
+    )
+
+    $source = 'RMMDetector'
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists($source)) {
+            New-EventLog -LogName Application -Source $source -ErrorAction Stop
+        }
+        Write-EventLog -LogName Application -Source $source `
+            -EventId $EventId -EntryType $EntryType -Message $Message `
+            -ErrorAction Stop
+    } catch {
+        if (-not $Silent -and -not $Json) {
+            Write-Host "[EVENTLOG] Could not write to event log: $_" -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Write-AllowlistedItem {
+    param([string]$Category, [string]$Item)
+    if (-not $Json -and -not $Silent) {
+        Write-Host "[ALLOWED] $Item" -ForegroundColor DarkGreen
+    }
+}
+
 # ─── Detection Functions ──────────────────────────────────────────────────────
 
 function Get-RMMProcesses {
@@ -254,7 +415,12 @@ function Get-RMMProcesses {
                 $entry = "$proc.exe"
                 if ($found -notcontains $entry) {
                     $found += $entry
-                    Write-Finding "Process" $entry
+                    if (Test-Allowlisted $entry) {
+                        Write-AllowlistedItem "Process" $entry
+                    } else {
+                        $risk = Get-RiskLevel $entry 'Process'
+                        Write-Finding "Process" $entry $risk
+                    }
                 }
             }
         }
@@ -265,7 +431,7 @@ function Get-RMMProcesses {
                 if ($found -notcontains $entry) {
                     $found += $entry
                     if (-not $Json) {
-                        Write-Host "[SUSPECT] $entry" -ForegroundColor Cyan
+                        Write-Host "[SUSPECT] [Medium] $entry" -ForegroundColor Cyan
                     }
                 }
             }
@@ -295,7 +461,12 @@ function Get-RMMInstalledSoftware {
                     $entry = $name
                     if ($found -notcontains $entry) {
                         $found += $entry
-                        Write-Finding "Software" $entry
+                        if (Test-Allowlisted $entry) {
+                            Write-AllowlistedItem "Software" $entry
+                        } else {
+                            $risk = Get-RiskLevel $entry 'Software'
+                            Write-Finding "Software" $entry $risk
+                        }
                     }
                 }
             }
@@ -320,7 +491,12 @@ function Get-RMMServices {
                 $entry = "$svcDisplay ($svcName) - Status: $($svc.Status)"
                 if ($found -notcontains $entry) {
                     $found += $entry
-                    Write-Finding "Service" $entry
+                    if (Test-Allowlisted $entry) {
+                        Write-AllowlistedItem "Service" $entry
+                    } else {
+                        $risk = Get-RiskLevel $entry 'Service'
+                        Write-Finding "Service" $entry $risk
+                    }
                 }
             }
         }
@@ -355,7 +531,12 @@ function Get-RMMStartupEntries {
                             $entry = "[$($path.Split('\')[-1])] $valueName = $($valueData.ToString().Substring(0, [Math]::Min(80, $valueData.ToString().Length)))"
                             if ($found -notcontains $entry) {
                                 $found += $entry
-                                Write-Finding "Startup" $entry
+                                if (Test-Allowlisted $entry) {
+                                    Write-AllowlistedItem "Startup" $entry
+                                } else {
+                                    $risk = Get-RiskLevel $entry 'Startup'
+                                    Write-Finding "Startup" $entry $risk
+                                }
                             }
                         }
                     }
@@ -386,7 +567,12 @@ function Get-RMMScheduledTasks {
                     $entry = "$taskPath$taskName"
                     if ($found -notcontains $entry) {
                         $found += $entry
-                        Write-Finding "Task" $entry
+                        if (Test-Allowlisted $entry) {
+                            Write-AllowlistedItem "Task" $entry
+                        } else {
+                            $risk = Get-RiskLevel $entry 'Task'
+                            Write-Finding "Task" $entry $risk
+                        }
                     }
                 }
             }
@@ -436,7 +622,12 @@ function Get-RMMNetworkConnections {
                 $entry = "Port $remotePort ($portInfo) -> $remoteAddr [$state]"
                 if ($found -notcontains $entry) {
                     $found += $entry
-                    Write-Finding "Network" $entry
+                    if (Test-Allowlisted $entry) {
+                        Write-AllowlistedItem "Network" $entry
+                    } else {
+                        $risk = Get-RiskLevel $entry 'Network'
+                        Write-Finding "Network" $entry $risk
+                    }
                 }
             }
         }
@@ -507,7 +698,12 @@ function Get-RMMInstalledFiles {
                 $entry = $candidate
                 if ($found -notcontains $entry) {
                     $found += $entry
-                    Write-Finding "Directory" $entry
+                    if (Test-Allowlisted $entry) {
+                        Write-AllowlistedItem "Directory" $entry
+                    } else {
+                        $risk = Get-RiskLevel $entry 'Directory'
+                        Write-Finding "Directory" $entry $risk
+                    }
                 }
             }
         }
@@ -527,7 +723,7 @@ $Banner = @"
   ██║     ██║ ╚═╝ ██║██║ ╚═╝ ██║
   ╚═╝     ╚═╝     ╚═╝╚═╝     ╚═╝
 
-  RMM DETECTOR v1.0
+  RMM DETECTOR v2.0
   Remote Monitoring Detection Tool
 "@
 
@@ -554,15 +750,64 @@ $FoundFiles      = Get-RMMInstalledFiles
 $TotalFindings = $FoundProcesses.Count + $FoundSoftware.Count + $FoundServices.Count +
                  $FoundStartup.Count + $FoundTasks.Count + $FoundNetwork.Count + $FoundFiles.Count
 
+# Separate allowlisted findings so they are not counted as alerts
+$AllAllFindings = @(
+    @{ Type = 'Process';   Items = $FoundProcesses }
+    @{ Type = 'Software';  Items = $FoundSoftware  }
+    @{ Type = 'Service';   Items = $FoundServices  }
+    @{ Type = 'Startup';   Items = $FoundStartup   }
+    @{ Type = 'Task';      Items = $FoundTasks      }
+    @{ Type = 'Network';   Items = $FoundNetwork    }
+    @{ Type = 'Directory'; Items = $FoundFiles      }
+)
+
+$AllowlistedItems   = [System.Collections.Generic.List[object]]::new()
+$UnauthorizedItems  = [System.Collections.Generic.List[object]]::new()
+
+foreach ($group in $AllAllFindings) {
+    foreach ($item in $group.Items) {
+        $risk   = Get-RiskLevel $item $group.Type
+        $record = [ordered]@{
+            Type         = $group.Type
+            Item         = $item
+            Risk         = $risk
+            ScanTime     = $ScanTime
+            Computer     = $ComputerName
+            User         = $UserName
+            Authorized   = (Test-Allowlisted $item)
+        }
+        if ($record.Authorized) {
+            $AllowlistedItems.Add($record)
+        } else {
+            $UnauthorizedItems.Add($record)
+        }
+    }
+}
+
+$TotalUnauthorized  = $UnauthorizedItems.Count
+$TotalAuthorized    = $AllowlistedItems.Count
+
+# Highest risk among unauthorized findings
+$RiskOrder = @{ 'Critical' = 4; 'High' = 3; 'Medium' = 2; 'Low' = 1 }
+$HighestRisk = if ($TotalUnauthorized -gt 0) {
+    ($UnauthorizedItems | Sort-Object { $RiskOrder[$_.Risk] } -Descending | Select-Object -First 1).Risk
+} else { 'None' }
+
 # ─── Output ───────────────────────────────────────────────────────────────────
 
 if ($Json) {
-    # JSON output
+    # JSON output – include risk levels and allowlist status
     $output = [ordered]@{
-        scan_time    = $ScanTime
-        computer     = $ComputerName
-        user         = $UserName
-        total        = $TotalFindings
+        scan_time        = $ScanTime
+        computer         = $ComputerName
+        user             = $UserName
+        signatures_ver   = if ($Signatures -and $Signatures.version) { $Signatures.version } else { 'built-in' }
+        total            = $TotalUnauthorized
+        total_authorized = $TotalAuthorized
+        highest_risk     = $HighestRisk
+        findings         = $UnauthorizedItems | ForEach-Object { [ordered]@{ type=$_.Type; item=$_.Item; risk=$_.Risk } }
+        authorized       = $AllowlistedItems  | ForEach-Object { [ordered]@{ type=$_.Type; item=$_.Item } }
+        # Legacy flat arrays for backwards compatibility
         processes    = $FoundProcesses
         software     = $FoundSoftware
         services     = $FoundServices
@@ -579,20 +824,25 @@ if ($Json) {
         Write-Host ("-" * 50) -ForegroundColor DarkGray
     }
 
-    if ($TotalFindings -gt 0) {
+    if ($TotalUnauthorized -gt 0) {
         Write-Host ""
-        Write-Host "  WARNING: Remote Management Software Detected" -ForegroundColor Red
+        Write-Host "  WARNING: Unauthorized Remote Management Software Detected" -ForegroundColor Red
+        Write-Host "  Highest Risk Level: $HighestRisk" -ForegroundColor (Get-RiskColor $HighestRisk)
         Write-Host ""
-        if ($FoundProcesses.Count -gt 0)  { Write-Host "  $($FoundProcesses.Count) Running Process(es)" -ForegroundColor Yellow }
-        if ($FoundSoftware.Count -gt 0)   { Write-Host "  $($FoundSoftware.Count) Installed Program(s)" -ForegroundColor Yellow }
-        if ($FoundServices.Count -gt 0)   { Write-Host "  $($FoundServices.Count) Service(s)" -ForegroundColor Yellow }
-        if ($FoundStartup.Count -gt 0)    { Write-Host "  $($FoundStartup.Count) Startup Entr(ies)" -ForegroundColor Yellow }
-        if ($FoundTasks.Count -gt 0)      { Write-Host "  $($FoundTasks.Count) Scheduled Task(s)" -ForegroundColor Yellow }
-        if ($FoundNetwork.Count -gt 0)    { Write-Host "  $($FoundNetwork.Count) Network Connection(s)" -ForegroundColor Yellow }
-        if ($FoundFiles.Count -gt 0)      { Write-Host "  $($FoundFiles.Count) Installation Directory/ies" -ForegroundColor Yellow }
+        $byType = $UnauthorizedItems | Group-Object Type
+        foreach ($g in $byType) {
+            Write-Host "  $($g.Count) $($g.Name)(s)" -ForegroundColor Yellow
+        }
+    } elseif ($TotalAuthorized -gt 0) {
+        Write-Host ""
+        Write-Host "  $TotalAuthorized authorized RMM tool(s) found (allowlisted – no alert)." -ForegroundColor DarkGreen
     } else {
         Write-Host ""
         Write-Host "  No RMM software detected." -ForegroundColor Green
+    }
+
+    if ($TotalAuthorized -gt 0 -and -not $Silent) {
+        Write-Host "  $TotalAuthorized item(s) skipped (allowlisted)." -ForegroundColor DarkGreen
     }
 
     if (-not $Silent) {
@@ -610,58 +860,91 @@ if ($Json) {
     $ReportLines += "=" * 60
     $ReportLines += "  RMM DETECTOR SECURITY SCAN REPORT"
     $ReportLines += "=" * 60
-    $ReportLines += "Scan Time : $ScanTime"
-    $ReportLines += "Computer  : $ComputerName"
-    $ReportLines += "User      : $UserName"
+    $ReportLines += "Scan Time        : $ScanTime"
+    $ReportLines += "Computer         : $ComputerName"
+    $ReportLines += "User             : $UserName"
+    $ReportLines += "Signatures Ver   : $(if ($Signatures -and $Signatures.version) { $Signatures.version } else { 'built-in' })"
+    $ReportLines += "Allowlisted Items: $TotalAuthorized"
+    $ReportLines += "Highest Risk     : $HighestRisk"
     $ReportLines += ""
 
     if ($FoundProcesses.Count -gt 0) {
         $ReportLines += "RUNNING PROCESSES ($($FoundProcesses.Count) found):"
-        $FoundProcesses | ForEach-Object { $ReportLines += "  [FOUND] $_" }
+        $FoundProcesses | ForEach-Object {
+            $r = Get-RiskLevel $_ 'Process'
+            $prefix = if (Test-Allowlisted $_) { '[ALLOWED]' } else { "[FOUND]  [$r]" }
+            $ReportLines += "  $prefix $_"
+        }
         $ReportLines += ""
     }
 
     if ($FoundSoftware.Count -gt 0) {
         $ReportLines += "INSTALLED SOFTWARE ($($FoundSoftware.Count) found):"
-        $FoundSoftware | ForEach-Object { $ReportLines += "  [FOUND] $_" }
+        $FoundSoftware | ForEach-Object {
+            $r = Get-RiskLevel $_ 'Software'
+            $prefix = if (Test-Allowlisted $_) { '[ALLOWED]' } else { "[FOUND]  [$r]" }
+            $ReportLines += "  $prefix $_"
+        }
         $ReportLines += ""
     }
 
     if ($FoundServices.Count -gt 0) {
         $ReportLines += "SERVICES ($($FoundServices.Count) found):"
-        $FoundServices | ForEach-Object { $ReportLines += "  [FOUND] $_" }
+        $FoundServices | ForEach-Object {
+            $r = Get-RiskLevel $_ 'Service'
+            $prefix = if (Test-Allowlisted $_) { '[ALLOWED]' } else { "[FOUND]  [$r]" }
+            $ReportLines += "  $prefix $_"
+        }
         $ReportLines += ""
     }
 
     if ($FoundStartup.Count -gt 0) {
         $ReportLines += "STARTUP ENTRIES ($($FoundStartup.Count) found):"
-        $FoundStartup | ForEach-Object { $ReportLines += "  [FOUND] $_" }
+        $FoundStartup | ForEach-Object {
+            $r = Get-RiskLevel $_ 'Startup'
+            $prefix = if (Test-Allowlisted $_) { '[ALLOWED]' } else { "[FOUND]  [$r]" }
+            $ReportLines += "  $prefix $_"
+        }
         $ReportLines += ""
     }
 
     if ($FoundTasks.Count -gt 0) {
         $ReportLines += "SCHEDULED TASKS ($($FoundTasks.Count) found):"
-        $FoundTasks | ForEach-Object { $ReportLines += "  [FOUND] $_" }
+        $FoundTasks | ForEach-Object {
+            $r = Get-RiskLevel $_ 'Task'
+            $prefix = if (Test-Allowlisted $_) { '[ALLOWED]' } else { "[FOUND]  [$r]" }
+            $ReportLines += "  $prefix $_"
+        }
         $ReportLines += ""
     }
 
     if ($FoundNetwork.Count -gt 0) {
         $ReportLines += "NETWORK CONNECTIONS ($($FoundNetwork.Count) found):"
-        $FoundNetwork | ForEach-Object { $ReportLines += "  [FOUND] $_" }
+        $FoundNetwork | ForEach-Object {
+            $r = Get-RiskLevel $_ 'Network'
+            $prefix = if (Test-Allowlisted $_) { '[ALLOWED]' } else { "[FOUND]  [$r]" }
+            $ReportLines += "  $prefix $_"
+        }
         $ReportLines += ""
     }
 
     if ($FoundFiles.Count -gt 0) {
         $ReportLines += "INSTALLATION DIRECTORIES ($($FoundFiles.Count) found):"
-        $FoundFiles | ForEach-Object { $ReportLines += "  [FOUND] $_" }
+        $FoundFiles | ForEach-Object {
+            $r = Get-RiskLevel $_ 'Directory'
+            $prefix = if (Test-Allowlisted $_) { '[ALLOWED]' } else { "[FOUND]  [$r]" }
+            $ReportLines += "  $prefix $_"
+        }
         $ReportLines += ""
     }
 
     $ReportLines += "-" * 60
-    if ($TotalFindings -gt 0) {
-        $ReportLines += "SUMMARY: $TotalFindings finding(s) detected."
+    if ($TotalUnauthorized -gt 0) {
+        $ReportLines += "SUMMARY: $TotalUnauthorized unauthorized finding(s) detected.  Highest risk: $HighestRisk."
         $ReportLines += "WARNING: Verify whether these tools were installed by your IT provider."
         $ReportLines += "         Unauthorized RMM software may indicate a compromised system."
+    } elseif ($TotalAuthorized -gt 0) {
+        $ReportLines += "SUMMARY: No unauthorized RMM software detected ($TotalAuthorized authorized item(s) skipped)."
     } else {
         $ReportLines += "SUMMARY: No RMM software detected."
     }
@@ -678,6 +961,42 @@ if ($Json) {
         }
     }
 
+    # ── CSV Export ───────────────────────────────────────────────────────────
+    if ($Csv) {
+        $allRecords = @($UnauthorizedItems) + @($AllowlistedItems)
+        if ($allRecords.Count -gt 0) {
+            $csvPath = [System.IO.Path]::ChangeExtension($OutputFile, '.csv')
+            try {
+                $allRecords | Select-Object ScanTime, Computer, User, Type, Item, Risk, Authorized |
+                    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+                if (-not $Silent) {
+                    Write-Host "CSV report saved to: $csvPath" -ForegroundColor Green
+                }
+            } catch {
+                if (-not $Silent) {
+                    Write-Host "Could not save CSV to $csvPath" -ForegroundColor Red
+                }
+            }
+        }
+    }
+
+    # ── Windows Event Log ────────────────────────────────────────────────────
+    if ($EventLog) {
+        if ($TotalUnauthorized -gt 0) {
+            $msg  = "RMM Detector scan on $ComputerName ($UserName) at $ScanTime`n"
+            $msg += "Unauthorized findings: $TotalUnauthorized  |  Highest risk: $HighestRisk`n`n"
+            foreach ($rec in $UnauthorizedItems) {
+                $msg += "[$($rec.Risk)] [$($rec.Type)] $($rec.Item)`n"
+            }
+            Send-EventLogEntry -Message $msg -EntryType Warning -EventId 1001
+        } else {
+            $authorized = if ($TotalAuthorized -gt 0) { " ($TotalAuthorized authorized item(s) skipped)" } else { "" }
+            Send-EventLogEntry `
+                -Message "RMM Detector scan on $ComputerName at $ScanTime: No unauthorized RMM software detected$authorized." `
+                -EntryType Information -EventId 1000
+        }
+    }
+
     # ── Notification after regular scan ──────────────────────────────────────
     # If -Notify is specified, check for active (ESTABLISHED) connections and
     # immediately show a popup to alert the user that someone is connected now.
@@ -688,13 +1007,13 @@ if ($Json) {
             Send-WindowsNotification `
                 -Title   "⚠ RMM ALERT: Active Connection Detected!" `
                 -Message "Someone is actively connected via RMM on $ComputerName.`n$connList"
-        } elseif ($TotalFindings -gt 0) {
+        } elseif ($TotalUnauthorized -gt 0) {
             Send-WindowsNotification `
                 -Title   "RMM Detector: Software Found" `
-                -Message "$TotalFindings RMM finding(s) detected on $ComputerName. No active session right now."
+                -Message "$TotalUnauthorized RMM finding(s) on $ComputerName. Highest risk: $HighestRisk. No active session right now."
         }
     }
-}
+} # end else (non-JSON output block)
 
 # ─── Monitor Mode ─────────────────────────────────────────────────────────────
 # Run AFTER the regular scan block so the full scan still executes first when
@@ -742,6 +1061,13 @@ if ($Monitor) {
             Send-WindowsNotification `
                 -Title   "⚠ RMM ALERT: Someone Is Connected!" `
                 -Message "Active RMM session on $ComputerName ($timestamp)`n$connList"
+
+            # Write to event log if enabled
+            if ($EventLog) {
+                Send-EventLogEntry `
+                    -Message "RMM Monitor: New active RMM connection(s) on $ComputerName ($timestamp)`n$connList" `
+                    -EntryType Warning -EventId 1002
+            }
         }
 
         # Also report dropped connections
@@ -764,4 +1090,16 @@ if ($Monitor) {
 
         Start-Sleep -Seconds $MonitorInterval
     }
+}
+
+# ─── Exit Code ────────────────────────────────────────────────────────────────
+# 0 = no unauthorized findings
+# 1 = unauthorized findings detected (Medium / Low risk)
+# 2 = high-risk or critical unauthorized findings detected
+# Allows automation scripts and CI/CD pipelines to take action on scan results.
+if ($TotalUnauthorized -gt 0) {
+    if ($HighestRisk -in @('Critical', 'High')) {
+        exit 2
+    }
+    exit 1
 }

@@ -23,10 +23,12 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 import re
 import csv
+import json
 import argparse
 import concurrent.futures
 import hashlib
 import base64
+import time
 import urllib3
 
 # Suppress SSL warnings for fallback requests
@@ -42,7 +44,12 @@ except ImportError:
 # --- Configuration ---
 TIMEOUT = 10
 MAX_THREADS = 10
+MAX_RETRIES = 2
+RETRY_BACKOFF = 1.5  # seconds; multiplied by attempt number
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+# Confidence score labels (1=Low, 2=Medium, 3=High)
+CONFIDENCE_LABELS = {3: 'High', 2: 'Medium', 1: 'Low', 0: 'Unknown'}
 
 # --- Expanded Signatures ---
 
@@ -195,6 +202,33 @@ FAVICON_HASHES = {
 
 PORTAL_KEYWORDS = ['support', 'portal', 'login', 'help', 'client', 'ticket',
                    'service', 'helpdesk', 'desk', 'request', 'contact', 'submit']
+
+
+def requests_get_with_retry(url, *, verify=True, allow_redirects=True, max_retries=None):
+    """GET request with exponential-backoff retry on transient errors.
+
+    max_retries defaults to the module-level MAX_RETRIES when not specified.
+    """
+    retries = MAX_RETRIES if max_retries is None else max_retries
+    headers = {'User-Agent': USER_AGENT}
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return requests.get(
+                url,
+                headers=headers,
+                timeout=TIMEOUT,
+                verify=verify,
+                allow_redirects=allow_redirects,
+            )
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(RETRY_BACKOFF * (attempt + 1))
+        except requests.exceptions.SSLError:
+            raise  # Let callers handle SSL errors explicitly
+    raise last_exc
 
 
 def get_cname(hostname):
@@ -366,7 +400,14 @@ def check_txt_records(domain):
 
 
 def analyze_target_url(url):
-    """Deep analysis of a specific URL using multiple detection methods."""
+    """Deep analysis of a specific URL using multiple detection methods.
+
+    Returns (vendor, method, evidence, confidence) where confidence is an
+    integer 1–3:
+      1 = single low-confidence indicator (HTML pattern, TXT record)
+      2 = moderate evidence (header, cookie, asset path, redirect)
+      3 = high-confidence (CNAME, URL pattern, favicon hash match)
+    """
     detections = []  # Collect all detections for confidence
 
     try:
@@ -378,42 +419,42 @@ def analyze_target_url(url):
         if cname:
             vendor, reason = check_domain_signatures(cname)
             if vendor:
-                return vendor, "DNS (CNAME)", f"{hostname} -> {reason}"
+                return vendor, "DNS (CNAME)", f"{hostname} -> {reason}", 3
 
         # 2. Check URL string
         vendor, reason = check_domain_signatures(hostname)
         if vendor:
-            return vendor, "URL Pattern", reason
+            return vendor, "URL Pattern", reason, 3
 
         # 3. Check TXT records (for root domain)
         root_domain = '.'.join(hostname.split('.')[-2:])
         vendor, reason = check_txt_records(root_domain)
         if vendor:
-            detections.append((vendor, "DNS (TXT)", reason))
+            detections.append((vendor, "DNS (TXT)", reason, 2))
 
         # 4. Check Favicon Hash
         vendor, reason = check_favicon_hash(url)
         if vendor:
-            return vendor, "Favicon Hash", reason
+            return vendor, "Favicon Hash", reason, 3
 
-        # 5. Fetch content
-        response = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=TIMEOUT, allow_redirects=True)
+        # 5. Fetch content (with retry)
+        response = requests_get_with_retry(url, allow_redirects=True)
 
         # 6. Check Redirects
         final_host = urlparse(response.url).netloc
         vendor, reason = check_domain_signatures(final_host)
         if vendor:
-            return vendor, "HTTP Redirect", f"Redirected to {reason}"
+            return vendor, "HTTP Redirect", f"Redirected to {reason}", 3
 
         # 7. Check HTTP Headers
         vendor, reason = check_headers(response)
         if vendor:
-            return vendor, "HTTP Headers", reason
+            return vendor, "HTTP Headers", reason, 2
 
         # 8. Check Cookies
         vendor, reason = check_cookies(response)
         if vendor:
-            return vendor, "Cookies", reason
+            return vendor, "Cookies", reason, 2
 
         # 9. Parse HTML for deeper inspection
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -421,22 +462,22 @@ def analyze_target_url(url):
         # 10. Check Asset Paths (JS/CSS)
         vendor, reason = check_asset_paths(soup)
         if vendor:
-            return vendor, "Asset Paths", reason
+            return vendor, "Asset Paths", reason, 2
 
         # 11. Check Meta Tags
         vendor, reason = check_meta_tags(soup)
         if vendor:
-            return vendor, "Meta Tags", reason
+            return vendor, "Meta Tags", reason, 2
 
         # 12. Check Form Fields
         vendor, reason = check_form_fields(soup)
         if vendor:
-            return vendor, "Form Analysis", reason
+            return vendor, "Form Analysis", reason, 2
 
         # 13. Check HTML Source (regex patterns)
         vendor, reason = check_text_signatures(response.text)
         if vendor:
-            return vendor, "HTML Source", reason
+            return vendor, "HTML Source", reason, 1
 
         # Return any earlier detections (like TXT records)
         if detections:
@@ -445,17 +486,16 @@ def analyze_target_url(url):
     except requests.exceptions.SSLError:
         # Try without SSL verification as fallback
         try:
-            response = requests.get(url, headers={'User-Agent': USER_AGENT},
-                                   timeout=TIMEOUT, verify=False, allow_redirects=True)
+            response = requests_get_with_retry(url, verify=False, allow_redirects=True)
             vendor, reason = check_text_signatures(response.text)
             if vendor:
-                return vendor, "HTML Source (SSL bypass)", reason
+                return vendor, "HTML Source (SSL bypass)", reason, 1
         except Exception:
             pass
     except Exception:
         pass
 
-    return None, None, None
+    return None, None, None, 0
 
 
 def process_company(url):
@@ -470,6 +510,7 @@ def process_company(url):
         'Detected Software': 'Not Detected',
         'Category': 'N/A',
         'Method': 'N/A',
+        'Confidence': 0,
         'Evidence': 'No clear indicators found'
     }
 
@@ -492,18 +533,19 @@ def process_company(url):
 
     try:
         # Step 1: Direct Analysis
-        vendor, method, evidence = analyze_target_url(url)
+        vendor, method, evidence, confidence = analyze_target_url(url)
         if vendor:
             result_row.update({
                 'Detected Software': vendor,
                 'Category': get_category(vendor),
                 'Method': method,
+                'Confidence': confidence,
                 'Evidence': evidence
             })
             return result_row
 
         # Step 2: Scrape for Portal Links
-        response = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=TIMEOUT)
+        response = requests_get_with_retry(url)
         soup = BeautifulSoup(response.text, 'html.parser')
 
         potential_links = []
@@ -523,12 +565,13 @@ def process_company(url):
 
         # Step 3: Analyze discovered links (limit to first 10 unique)
         for link in list(set(potential_links))[:10]:
-            vendor, method, evidence = analyze_target_url(link)
+            vendor, method, evidence, confidence = analyze_target_url(link)
             if vendor:
                 result_row.update({
                     'Detected Software': vendor,
                     'Category': get_category(vendor),
                     'Method': f"Portal Discovery ({method})",
+                    'Confidence': confidence,
                     'Evidence': f"Found via '{link}': {evidence}"
                 })
                 return result_row
@@ -540,6 +583,8 @@ def process_company(url):
 
 
 def main():
+    global MAX_RETRIES  # allow --retries CLI flag to override module default
+
     parser = argparse.ArgumentParser(
         description="Enhanced RMM/PSA/Helpdesk Detector - Detect software platforms from a list of URLs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -553,14 +598,32 @@ Detected Platforms:
 Detection Methods:
   DNS CNAME/TXT, URL patterns, HTTP headers, cookies, favicon hashing,
   HTML source analysis, JS/CSS paths, meta tags, form fingerprinting
+
+Confidence Scores (1-3):
+  3 = High    (CNAME, direct URL match, favicon hash)
+  2 = Medium  (HTTP headers/cookies, asset paths, meta tags)
+  1 = Low     (HTML source pattern, TXT record)
+  0 = Unknown (not detected or error)
+
+Exit Codes:
+  0 = No detections
+  1 = One or more platforms detected
         """
     )
     parser.add_argument('input_file', help="Path to input file (CSV or TXT)")
-    parser.add_argument('output_file', help="Path to output CSV file")
+    parser.add_argument('output_file', help="Path to output file (CSV or JSON, depending on --format)")
     parser.add_argument('--column', default='URL', help="Name of the URL column in input file (default: 'URL')")
-    parser.add_argument('--threads', type=int, default=MAX_THREADS, help=f"Number of concurrent threads (default: {MAX_THREADS})")
+    parser.add_argument('--threads', type=int, default=MAX_THREADS,
+                        help=f"Number of concurrent threads (default: {MAX_THREADS})")
+    parser.add_argument('--format', choices=['csv', 'json'], default='csv',
+                        help="Output format: csv (default) or json")
+    parser.add_argument('--retries', type=int, default=MAX_RETRIES,
+                        help=f"Max HTTP retries per URL (default: {MAX_RETRIES})")
 
     args = parser.parse_args()
+
+    # Override module-level retry default from CLI arg
+    MAX_RETRIES = args.retries
 
     print(f"[*] Enhanced RMM/PSA Detector")
     print(f"[*] Reading from {args.input_file}...")
@@ -630,23 +693,35 @@ Detection Methods:
             status = data['Detected Software']
             if status != 'Not Detected':
                 detected_count += 1
-                print(f"[{completed}/{total}] + {data['Input URL']} -> {status} ({data['Category']})")
+                confidence_label = CONFIDENCE_LABELS.get(data.get('Confidence', 0), 'Unknown')
+                print(f"[{completed}/{total}] + {data['Input URL']} -> {status} "
+                      f"({data['Category']}, confidence: {confidence_label})")
             else:
                 print(f"[{completed}/{total}] - {data['Input URL']} -> Not Detected")
 
-    # Write Output CSV
-    keys = ['Input URL', 'Detected Software', 'Category', 'Method', 'Evidence']
+    # Write Output
     try:
-        with open(args.output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
-            writer.writeheader()
-            writer.writerows(results)
+        if args.format == 'json':
+            with open(args.output_file, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+        else:
+            keys = ['Input URL', 'Detected Software', 'Category', 'Method', 'Confidence', 'Evidence']
+            with open(args.output_file, 'w', newline='', encoding='utf-8') as f:
+                # extrasaction='ignore' drops fields not in keys (e.g. future additions
+                # to process_company that are not yet in the CSV schema).
+                writer = csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
+                writer.writeheader()
+                writer.writerows(results)
 
         print(f"\n[*] Scan complete!")
-        print(f"[*] Detected: {detected_count}/{total} ({100*detected_count/total:.1f}%)")
-        print(f"[*] Results saved to {args.output_file}")
+        if total > 0:
+            print(f"[*] Detected: {detected_count}/{total} ({100*detected_count/total:.1f}%)")
+        print(f"[*] Results saved to {args.output_file} (format: {args.format})")
     except Exception as e:
         print(f"[!] Error writing output file: {e}")
+        raise SystemExit(1)
+
+    raise SystemExit(1 if detected_count > 0 else 0)
 
 
 if __name__ == "__main__":
