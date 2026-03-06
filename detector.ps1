@@ -30,11 +30,27 @@
 .PARAMETER SignaturesFile
     Path to signatures.json database (default: same directory as script).
 
+.PARAMETER Notify
+    Show a Windows notification popup when RMM activity is detected.
+    In regular scan mode: notifies if any active (ESTABLISHED) RMM connections are found.
+    In monitor mode: notifies each time a new active connection is detected.
+
+.PARAMETER Monitor
+    Enable continuous monitoring mode. Polls for active RMM connections at the
+    specified interval and immediately shows a notification popup when a new
+    connection is detected. Press Ctrl+C to stop.
+
+.PARAMETER MonitorInterval
+    Seconds between checks in monitor mode (default: 10).
+
 .EXAMPLE
     .\detector.ps1
     .\detector.ps1 -Silent
     .\detector.ps1 -Json
     .\detector.ps1 -OutputFile "C:\Temp\my_report.txt"
+    .\detector.ps1 -Notify
+    .\detector.ps1 -Monitor
+    .\detector.ps1 -Monitor -MonitorInterval 5
 
 .NOTES
     Run as Administrator for complete results.
@@ -46,7 +62,10 @@ param(
     [switch]$Silent,
     [switch]$Json,
     [string]$OutputFile = "rmm_report.txt",
-    [string]$SignaturesFile = ""
+    [string]$SignaturesFile = "",
+    [switch]$Notify,
+    [switch]$Monitor,
+    [int]$MonitorInterval = 10
 )
 
 Set-StrictMode -Version Latest
@@ -157,6 +176,67 @@ function Write-Finding {
     param([string]$Category, [string]$Item)
     if (-not $Json) {
         Write-Host "[FOUND] $Item" -ForegroundColor Yellow
+    }
+}
+
+# ─── Notification ─────────────────────────────────────────────────────────────
+
+function Send-WindowsNotification {
+    <#
+    .SYNOPSIS
+        Show a Windows notification popup. Tries Toast notifications first
+        (Windows 10+), then falls back to a system-tray balloon tip.
+    #>
+    param(
+        [string]$Title   = "RMM Detector Alert",
+        [string]$Message = "RMM activity detected."
+    )
+
+    $notified = $false
+
+    # Method 1: Windows Toast Notification (Windows 10 / Server 2019+)
+    try {
+        [void][Windows.UI.Notifications.ToastNotificationManager,
+               Windows.UI.Notifications, ContentType = WindowsRuntime]
+        [void][Windows.Data.Xml.Dom.XmlDocument,
+               Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+
+        $titleEsc   = [System.Security.SecurityElement]::Escape($Title)
+        $messageEsc = [System.Security.SecurityElement]::Escape($Message)
+        $toastXml   = "<toast><visual><binding template='ToastGeneric'>" +
+                      "<text>$titleEsc</text>" +
+                      "<text>$messageEsc</text>" +
+                      "</binding></visual></toast>"
+
+        $xmlDoc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $xmlDoc.LoadXml($toastXml)
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($xmlDoc)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(
+            'RMM Detector').Show($toast)
+        $notified = $true
+    } catch {}
+
+    # Method 2: Fallback – system-tray balloon tip via Windows Forms
+    if (-not $notified) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+            Add-Type -AssemblyName System.Drawing      -ErrorAction Stop
+
+            $balloon = New-Object System.Windows.Forms.NotifyIcon
+            $balloon.Icon              = [System.Drawing.SystemIcons]::Warning
+            $balloon.BalloonTipIcon    = [System.Windows.Forms.ToolTipIcon]::Warning
+            $balloon.BalloonTipTitle   = $Title
+            $balloon.BalloonTipText    = $Message
+            $balloon.Visible           = $true
+            $balloon.ShowBalloonTip(10000)
+            Start-Sleep -Milliseconds 500
+            $balloon.Dispose()
+            $notified = $true
+        } catch {}
+    }
+
+    if (-not $notified -and -not $Silent -and -not $Json) {
+        Write-Host "[NOTIFY] $Title - $Message" -ForegroundColor Magenta
     }
 }
 
@@ -368,6 +448,46 @@ function Get-RMMNetworkConnections {
     return $found
 }
 
+# Returns only ESTABLISHED connections – used to determine if a session is
+# actively in progress (someone is currently connected).
+function Get-ActiveRMMConnections {
+    $found     = [System.Collections.Generic.HashSet[string]]::new()
+    $rmmPorts  = @(5938, 7070, 21115, 21116, 21117, 21118, 21119, 8040, 4343,
+                   9000, 9001, 6129, 55510, 8200, 21121)
+
+    try {
+        $connections = Get-NetTCPConnection -State Established 2>$null |
+                       Where-Object { $_.RemoteAddress -notin @('0.0.0.0', '::', '127.0.0.1', '::1') }
+
+        foreach ($conn in $connections) {
+            if ($rmmPorts -contains $conn.RemotePort) {
+                $portInfo = switch ($conn.RemotePort) {
+                    5938  { "TeamViewer" }
+                    7070  { "ScreenConnect/ConnectWise Control" }
+                    21115 { "AnyDesk" }
+                    21116 { "AnyDesk" }
+                    21117 { "AnyDesk" }
+                    21118 { "AnyDesk" }
+                    21119 { "AnyDesk" }
+                    8040  { "MeshCentral" }
+                    4343  { "MeshCentral" }
+                    9000  { "SimpleHelp" }
+                    9001  { "SimpleHelp/TacticalRMM" }
+                    6129  { "DameWare" }
+                    55510 { "GoToAssist" }
+                    8200  { "RustDesk" }
+                    21121 { "RustDesk" }
+                    default { "RMM Port" }
+                }
+
+                [void]$found.Add("Port $($conn.RemotePort) ($portInfo) -> $($conn.RemoteAddress) [ESTABLISHED]")
+            }
+        }
+    } catch {}
+
+    return [string[]]$found
+}
+
 function Get-RMMInstalledFiles {
     Write-Status "`nScanning Installation Directories..."
     $found = @()
@@ -556,5 +676,92 @@ if ($Json) {
         if (-not $Silent -and -not $Json) {
             Write-Host "Could not save report to $OutputFile" -ForegroundColor Red
         }
+    }
+
+    # ── Notification after regular scan ──────────────────────────────────────
+    # If -Notify is specified, check for active (ESTABLISHED) connections and
+    # immediately show a popup to alert the user that someone is connected now.
+    if ($Notify) {
+        $ActiveConns = Get-ActiveRMMConnections
+        if ($ActiveConns.Count -gt 0) {
+            $connList = $ActiveConns -join "`n"
+            Send-WindowsNotification `
+                -Title   "⚠ RMM ALERT: Active Connection Detected!" `
+                -Message "Someone is actively connected via RMM on $ComputerName.`n$connList"
+        } elseif ($TotalFindings -gt 0) {
+            Send-WindowsNotification `
+                -Title   "RMM Detector: Software Found" `
+                -Message "$TotalFindings RMM finding(s) detected on $ComputerName. No active session right now."
+        }
+    }
+}
+
+# ─── Monitor Mode ─────────────────────────────────────────────────────────────
+# Run AFTER the regular scan block so the full scan still executes first when
+# -Monitor is combined with a regular run.
+
+if ($Monitor) {
+    if (-not $Silent -and -not $Json) {
+        Write-Host ""
+        Write-Host ("=" * 50) -ForegroundColor Cyan
+        Write-Host "  ACTIVE CONNECTION MONITOR" -ForegroundColor Cyan
+        Write-Host ("=" * 50) -ForegroundColor Cyan
+        Write-Host "  Watching for active RMM sessions every $MonitorInterval second(s)."
+        Write-Host "  A notification popup will appear instantly when"
+        Write-Host "  someone connects via a known RMM tool."
+        Write-Host "  Press Ctrl+C to stop monitoring."
+        Write-Host ("=" * 50) -ForegroundColor Cyan
+        Write-Host ""
+    }
+
+    $PreviousConnections = [System.Collections.Generic.HashSet[string]]::new()
+
+    while ($true) {
+        $CurrentConnections = [System.Collections.Generic.HashSet[string]]::new(
+            [string[]](Get-ActiveRMMConnections),
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+
+        # Find newly-established connections not seen in the previous check
+        $NewConnections = $CurrentConnections | Where-Object { -not $PreviousConnections.Contains($_) }
+
+        if ($NewConnections.Count -gt 0) {
+            $timestamp  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $connList   = $NewConnections -join "`n"
+
+            if (-not $Silent -and -not $Json) {
+                Write-Host ""
+                Write-Host "[ALERT] $timestamp  New active RMM connection(s) detected on $ComputerName!" `
+                    -ForegroundColor Red
+                $NewConnections | ForEach-Object {
+                    Write-Host "  >> $_" -ForegroundColor Yellow
+                }
+            }
+
+            # Always fire the popup in monitor mode (regardless of -Notify flag)
+            Send-WindowsNotification `
+                -Title   "⚠ RMM ALERT: Someone Is Connected!" `
+                -Message "Active RMM session on $ComputerName ($timestamp)`n$connList"
+        }
+
+        # Also report dropped connections
+        $DroppedConnections = $PreviousConnections | Where-Object { -not $CurrentConnections.Contains($_) }
+        if ($DroppedConnections.Count -gt 0 -and -not $Silent -and -not $Json) {
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host ""
+            Write-Host "[INFO]  $timestamp  RMM connection(s) ended:" -ForegroundColor Gray
+            $DroppedConnections | ForEach-Object {
+                Write-Host "  -- $_" -ForegroundColor DarkGray
+            }
+        }
+
+        $PreviousConnections = $CurrentConnections
+
+        if ($CurrentConnections.Count -gt 0 -and -not $Silent -and -not $Json) {
+            Write-Host "  [ACTIVE] $($CurrentConnections.Count) RMM session(s) in progress..." `
+                -ForegroundColor Red
+        }
+
+        Start-Sleep -Seconds $MonitorInterval
     }
 }
