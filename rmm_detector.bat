@@ -3,14 +3,18 @@ setlocal EnableDelayedExpansion
 
 :: ============================================================
 ::  RMM Detector - Remote Monitoring & Management Scanner
-::  Version 1.0
+::  Version 2.0
 ::  Usage:
 ::    rmm_detector.bat              - Standard scan
 ::    rmm_detector.bat /silent      - Silent mode (findings only)
 ::    rmm_detector.bat /json        - JSON output
+::    rmm_detector.bat /csv         - Export CSV report alongside text report
+::    rmm_detector.bat /eventlog    - Write findings to Windows Event Log
 ::    rmm_detector.bat /notify      - Popup notification if active RMM session found
 ::    rmm_detector.bat /monitor     - Continuous monitoring with instant popups
 ::    rmm_detector.bat /interval N  - Set monitor interval in seconds (default: 10)
+::    rmm_detector.bat /allowlist PATH  - File of approved tool names to skip
+::    rmm_detector.bat /allow LIST      - Comma-separated approved tool names
 ::    rmm_detector.bat /help        - Show help
 :: ============================================================
 
@@ -33,6 +37,16 @@ if /I "!ARG!"=="/silent" (
 if /I "!ARG!"=="/json" (
     set "MODE=json"
     set "PS_ARGS=!PS_ARGS! -Json"
+    shift
+    goto :parse_args
+)
+if /I "!ARG!"=="/csv" (
+    set "PS_ARGS=!PS_ARGS! -Csv"
+    shift
+    goto :parse_args
+)
+if /I "!ARG!"=="/eventlog" (
+    set "PS_ARGS=!PS_ARGS! -EventLog"
     shift
     goto :parse_args
 )
@@ -60,6 +74,18 @@ if /I "!ARG!"=="/output" (
     shift
     goto :parse_args
 )
+if /I "!ARG!"=="/allowlist" (
+    set "PS_ARGS=!PS_ARGS! -AllowListFile "%~2""
+    shift
+    shift
+    goto :parse_args
+)
+if /I "!ARG!"=="/allow" (
+    set "PS_ARGS=!PS_ARGS! -AllowList "%~2""
+    shift
+    shift
+    goto :parse_args
+)
 if /I "!ARG!"=="/help" goto :show_help
 shift
 goto :parse_args
@@ -79,10 +105,14 @@ echo Usage:
 echo   rmm_detector.bat               Standard scan with full output
 echo   rmm_detector.bat /silent       Silent mode - only show findings
 echo   rmm_detector.bat /json         Output results in JSON format
+echo   rmm_detector.bat /csv          Export a CSV report alongside the text report
+echo   rmm_detector.bat /eventlog     Write findings to Windows Application Event Log
 echo   rmm_detector.bat /notify       Show a popup if an active RMM session is found
 echo   rmm_detector.bat /monitor      Continuous monitoring - instant popup on connection
 echo   rmm_detector.bat /interval N   Check every N seconds in monitor mode (default: 10)
 echo   rmm_detector.bat /output PATH  Save report to custom path
+echo   rmm_detector.bat /allowlist F  Path to file with authorized tool names (one per line)
+echo   rmm_detector.bat /allow LIST   Comma-separated list of authorized tool names
 echo   rmm_detector.bat /help         Show this help
 echo.
 echo The tool scans for:
@@ -93,6 +123,17 @@ echo   - Startup registry entries
 echo   - Scheduled tasks
 echo   - Network connections on RMM ports
 echo   - Installation directories
+echo.
+echo Risk levels assigned to each finding:
+echo   Critical - Active ESTABLISHED network connection
+echo   High     - Running process or high-risk tool
+echo   Medium   - Installed service or software
+echo   Low      - Registry/file presence only
+echo.
+echo Exit codes:
+echo   0 = No unauthorized findings
+echo   1 = Unauthorized findings (Medium/Low risk)
+echo   2 = High or Critical risk findings detected
 echo.
 echo Notification modes:
 echo   /notify   - After a one-time scan, show a popup if an active RMM
@@ -131,7 +172,7 @@ if "!MODE!"=="" (
     echo   ██║     ██║ ╚═╝ ██║██║ ╚═╝ ██║
     echo   ╚═╝     ╚═╝     ╚═╝╚═╝     ╚═╝
     echo.
-    echo   RMM DETECTOR v1.0
+    echo   RMM DETECTOR v2.0
     echo   Remote Monitoring Detection Tool
     echo.
     echo ====================================================
@@ -148,7 +189,7 @@ if "!MODE!"=="monitor" (
     echo   ██║     ██║ ╚═╝ ██║██║ ╚═╝ ██║
     echo   ╚═╝     ╚═╝     ╚═╝╚═╝     ╚═╝
     echo.
-    echo   RMM DETECTOR v1.0 - MONITOR MODE
+    echo   RMM DETECTOR v2.0 - MONITOR MODE
     echo   Instant popup alerts when someone connects
     echo.
 )

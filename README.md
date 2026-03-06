@@ -90,6 +90,11 @@ rmm_detector.bat /silent
 rmm_detector.bat /json
 ```
 
+**CSV export** – export a structured CSV alongside the text report:
+```batch
+rmm_detector.bat /csv
+```
+
 **Custom report path:**
 ```batch
 rmm_detector.bat /output C:\Temp\my_report.txt
@@ -106,15 +111,29 @@ rmm_detector.bat /monitor
 rmm_detector.bat /monitor /interval 5
 ```
 
+**Allowlist** – skip tools that your organisation has authorised:
+```batch
+rmm_detector.bat /allowlist C:\Config\approved_rmm.txt
+rmm_detector.bat /allow "TeamViewer,NinjaRMM"
+```
+
+**Windows Event Log** – write findings to the Application log for SIEM integration:
+```batch
+rmm_detector.bat /eventlog
+```
+
 **Run PowerShell directly:**
 ```powershell
 .\detector.ps1
 .\detector.ps1 -Silent
 .\detector.ps1 -Json
+.\detector.ps1 -Csv
 .\detector.ps1 -OutputFile "C:\Temp\report.txt"
 .\detector.ps1 -Notify
 .\detector.ps1 -Monitor
 .\detector.ps1 -Monitor -MonitorInterval 5
+.\detector.ps1 -AllowListFile "C:\Config\approved_rmm.txt"
+.\detector.ps1 -AllowList "TeamViewer,NinjaRMM" -EventLog
 ```
 
 ### Windows Notification Popup
@@ -174,6 +193,123 @@ timestamps. Press **Ctrl+C** to stop monitoring.
 | **Network Connections** | Flags active connections on known RMM ports (5938, 7070, 21116, etc.) |
 | **File System** | Checks Program Files and ProgramData for known installation directories |
 | **Active Session Monitor** | Continuously watches for ESTABLISHED RMM connections and fires instant popups |
+
+### Enterprise Features
+
+#### Risk Scoring
+
+Every finding is assigned a risk level:
+
+| Risk | Condition | Console colour |
+|------|-----------|----------------|
+| **Critical** | Active ESTABLISHED network connection | 🔴 Red |
+| **High** | Running process, or high-risk vendor | 🟡 Yellow |
+| **Medium** | Installed service or software | 🔵 Cyan |
+| **Low** | Registry key, scheduled task, or installation directory only | ⚫ Grey |
+
+Risk levels are persisted in the text report, CSV export, and Windows Event Log entries.
+
+#### Allowlist (Authorised Tools)
+
+Exclude known-good RMM tools from triggering alerts, keeping results focused on
+**unauthorised** software only.
+
+**Via command line:**
+```powershell
+.\detector.ps1 -AllowList "TeamViewer,NinjaRMM"
+```
+```batch
+rmm_detector.bat /allow "TeamViewer,NinjaRMM"
+```
+
+**Via file (one name per line or JSON array):**
+
+`C:\Config\approved_rmm.txt`
+```
+# Lines starting with # are ignored
+TeamViewer
+NinjaRMM
+```
+
+```powershell
+.\detector.ps1 -AllowListFile "C:\Config\approved_rmm.txt"
+```
+```batch
+rmm_detector.bat /allowlist C:\Config\approved_rmm.txt
+```
+
+Allowlisted items appear in the scan output as `[ALLOWED]` and are excluded from
+the total count and exit code evaluation.
+
+#### Windows Event Log Integration
+
+Write scan findings to the **Windows Application Event Log** (Source: `RMMDetector`) for
+forwarding to a SIEM or log management platform:
+
+```powershell
+.\detector.ps1 -EventLog
+```
+```batch
+rmm_detector.bat /eventlog
+```
+
+| Event ID | Entry Type | Trigger |
+|----------|-----------|---------|
+| 1000 | Information | Scan completed – no unauthorised findings |
+| 1001 | Warning | Unauthorised RMM finding(s) detected |
+| 1002 | Warning | Monitor mode – new active connection detected |
+
+#### CSV Export
+
+Export a machine-readable CSV alongside the text report for aggregation or ticketing:
+
+```powershell
+.\detector.ps1 -Csv
+```
+```batch
+rmm_detector.bat /csv
+```
+
+Columns: `ScanTime`, `Computer`, `User`, `Type`, `Item`, `Risk`, `Authorized`
+
+#### Exit Codes
+
+The script returns a meaningful exit code, enabling use in automation pipelines, CI/CD
+checks, or scheduled tasks:
+
+| Exit Code | Meaning |
+|-----------|---------|
+| `0` | No unauthorised findings |
+| `1` | Unauthorised findings detected (Medium or Low risk) |
+| `2` | High or Critical risk findings detected |
+
+```powershell
+.\detector.ps1 -Silent
+if ($LASTEXITCODE -ge 2) { Send-Alert "Critical RMM finding!" }
+```
+
+#### JSON Output (Enhanced)
+
+The `-Json` output now includes risk levels, allowlist status, and signatures version:
+
+```json
+{
+  "scan_time": "2024-01-15 14:32:07",
+  "computer": "WORKSTATION-01",
+  "user": "jsmith",
+  "signatures_ver": "2.0.0",
+  "total": 2,
+  "total_authorized": 1,
+  "highest_risk": "High",
+  "findings": [
+    { "type": "Process", "item": "TeamViewer.exe", "risk": "High" },
+    { "type": "Service", "item": "Mesh Agent (MeshAgent) - Status: Running", "risk": "Medium" }
+  ],
+  "authorized": [
+    { "type": "Process", "item": "NinjaRMMAgent.exe" }
+  ]
+}
+```
 
 ### Detected Software (Windows)
 
@@ -268,6 +404,16 @@ python rmmdetector.py urls.txt results.csv
 python rmmdetector.py companies.csv results.csv --threads 20
 ```
 
+**JSON output format:**
+```bash
+python rmmdetector.py companies.csv results.json --format json
+```
+
+**Retry configuration:**
+```bash
+python rmmdetector.py companies.csv results.csv --retries 3
+```
+
 ### Web Detection Methods
 
 | Method | Description |
@@ -287,12 +433,17 @@ python rmmdetector.py companies.csv results.csv --threads 20
 
 ### Output
 
-Results are written to a CSV file with columns:
+Results are written to a CSV or JSON file with columns/fields:
 - `Input URL` – Original URL from input
 - `Detected Software` – Identified platform (or "Not Detected")
 - `Category` – PSA / RMM / Remote Access / Helpdesk/ITSM
 - `Method` – Detection method used
+- `Confidence` – Detection confidence score (1=Low, 2=Medium, 3=High)
 - `Evidence` – Specific indicator that triggered detection
+
+**Exit codes:**
+- `0` – No platforms detected
+- `1` – One or more platforms detected
 
 ---
 
