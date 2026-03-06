@@ -108,7 +108,11 @@ if (Test-Path $SignaturesFile) {
     try {
         $Signatures = Get-Content $SignaturesFile -Raw | ConvertFrom-Json
     } catch {
-        # Fall back to built-in signatures
+        # Fall back to built-in signatures but warn the user
+        if (-not $Silent -and -not $Json) {
+            Write-Host "[WARNING] Could not parse signatures file '$SignaturesFile': $_" -ForegroundColor Yellow
+            Write-Host "          Falling back to built-in signatures." -ForegroundColor Yellow
+        }
     }
 }
 
@@ -217,7 +221,11 @@ if (-not [string]::IsNullOrEmpty($AllowListFile) -and (Test-Path $AllowListFile)
                 }
             }
         }
-    } catch {}
+    } catch {
+        if (-not $Silent -and -not $Json) {
+            Write-Host "[WARNING] Could not read allowlist file '$AllowListFile': $_" -ForegroundColor Yellow
+        }
+    }
 }
 
 # Returns $true if the finding string contains an allowlisted tool name
