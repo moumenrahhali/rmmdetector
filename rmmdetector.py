@@ -237,7 +237,9 @@ def get_cname(hostname):
         answers = dns.resolver.resolve(hostname, 'CNAME')
         for rdata in answers:
             return str(rdata.target).rstrip('.')
-    except Exception:
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.resolver.Timeout,
+            dns.name.EmptyLabel, dns.exception.DNSException):
         return None
 
 
@@ -246,7 +248,9 @@ def get_txt_records(domain):
     try:
         answers = dns.resolver.resolve(domain, 'TXT')
         return [str(rdata) for rdata in answers]
-    except Exception:
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+            dns.resolver.NoNameservers, dns.resolver.Timeout,
+            dns.name.EmptyLabel, dns.exception.DNSException):
         return []
 
 
@@ -373,7 +377,7 @@ def check_favicon_hash(url):
 
             if favicon_hash in FAVICON_HASHES:
                 return FAVICON_HASHES[favicon_hash], f"Favicon hash: {favicon_hash}"
-    except Exception:
+    except (requests.exceptions.RequestException, OSError):
         pass
 
     return None, None
@@ -490,9 +494,9 @@ def analyze_target_url(url):
             vendor, reason = check_text_signatures(response.text)
             if vendor:
                 return vendor, "HTML Source (SSL bypass)", reason, 1
-        except Exception:
+        except (requests.exceptions.RequestException, OSError):
             pass
-    except Exception:
+    except (requests.exceptions.RequestException, OSError):
         pass
 
     return None, None, None, 0
@@ -502,8 +506,20 @@ def process_company(url):
     """Main logic: Scans homepage and hunts for portal links."""
     # Normalize URL
     original_url = url
+    url = url.strip()
+
+    if not url:
+        return {
+            'Input URL': original_url,
+            'Detected Software': 'Not Detected',
+            'Category': 'N/A',
+            'Method': 'N/A',
+            'Confidence': 0,
+            'Evidence': 'Empty or whitespace-only URL — skipped'
+        }
+
     if not url.startswith('http'):
-        url = 'https://' + url.strip()
+        url = 'https://' + url
 
     result_row = {
         'Input URL': original_url,
@@ -622,6 +638,12 @@ Exit Codes:
 
     args = parser.parse_args()
 
+    # Validate arguments
+    if args.retries < 0:
+        parser.error("--retries must be a non-negative integer")
+    if args.threads < 1:
+        parser.error("--threads must be at least 1")
+
     # Override module-level retry default from CLI arg
     MAX_RETRIES = args.retries
 
@@ -647,7 +669,7 @@ Exit Codes:
             if is_csv:
                 # CSV format: comma-delimited with header row
                 reader = csv.DictReader(f)
-                if args.column not in reader.fieldnames:
+                if not reader.fieldnames or args.column not in reader.fieldnames:
                     print(f"[!] Error: Column '{args.column}' not found. Available: {reader.fieldnames}")
                     return
 
