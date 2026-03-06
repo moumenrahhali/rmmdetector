@@ -5,10 +5,13 @@ setlocal EnableDelayedExpansion
 ::  RMM Detector - Remote Monitoring & Management Scanner
 ::  Version 1.0
 ::  Usage:
-::    rmm_detector.bat           - Standard scan
-::    rmm_detector.bat /silent   - Silent mode (findings only)
-::    rmm_detector.bat /json     - JSON output
-::    rmm_detector.bat /help     - Show help
+::    rmm_detector.bat              - Standard scan
+::    rmm_detector.bat /silent      - Silent mode (findings only)
+::    rmm_detector.bat /json        - JSON output
+::    rmm_detector.bat /notify      - Popup notification if active RMM session found
+::    rmm_detector.bat /monitor     - Continuous monitoring with instant popups
+::    rmm_detector.bat /interval N  - Set monitor interval in seconds (default: 10)
+::    rmm_detector.bat /help        - Show help
 :: ============================================================
 
 set "SCRIPT_DIR=%~dp0"
@@ -30,6 +33,23 @@ if /I "!ARG!"=="/silent" (
 if /I "!ARG!"=="/json" (
     set "MODE=json"
     set "PS_ARGS=!PS_ARGS! -Json"
+    shift
+    goto :parse_args
+)
+if /I "!ARG!"=="/notify" (
+    set "PS_ARGS=!PS_ARGS! -Notify"
+    shift
+    goto :parse_args
+)
+if /I "!ARG!"=="/monitor" (
+    set "MODE=monitor"
+    set "PS_ARGS=!PS_ARGS! -Monitor"
+    shift
+    goto :parse_args
+)
+if /I "!ARG!"=="/interval" (
+    set "PS_ARGS=!PS_ARGS! -MonitorInterval %~2"
+    shift
     shift
     goto :parse_args
 )
@@ -59,6 +79,9 @@ echo Usage:
 echo   rmm_detector.bat               Standard scan with full output
 echo   rmm_detector.bat /silent       Silent mode - only show findings
 echo   rmm_detector.bat /json         Output results in JSON format
+echo   rmm_detector.bat /notify       Show a popup if an active RMM session is found
+echo   rmm_detector.bat /monitor      Continuous monitoring - instant popup on connection
+echo   rmm_detector.bat /interval N   Check every N seconds in monitor mode (default: 10)
 echo   rmm_detector.bat /output PATH  Save report to custom path
 echo   rmm_detector.bat /help         Show this help
 echo.
@@ -70,6 +93,12 @@ echo   - Startup registry entries
 echo   - Scheduled tasks
 echo   - Network connections on RMM ports
 echo   - Installation directories
+echo.
+echo Notification modes:
+echo   /notify   - After a one-time scan, show a popup if an active RMM
+echo               connection (ESTABLISHED) is detected right now.
+echo   /monitor  - Run continuously and show an instant popup the moment
+echo               a new active RMM session is detected. Press Ctrl+C to stop.
 echo.
 echo Note: Run as Administrator for complete results.
 echo This tool is for DETECTION ONLY - it will not remove software.
@@ -92,7 +121,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Show banner in normal mode
+:: Show banner in normal/monitor mode
 if "!MODE!"=="" (
     echo.
     echo   ██████╗ ███╗   ███╗███╗   ███╗
@@ -108,6 +137,19 @@ if "!MODE!"=="" (
     echo ====================================================
     echo   Starting RMM Security Scan...
     echo ====================================================
+    echo.
+)
+if "!MODE!"=="monitor" (
+    echo.
+    echo   ██████╗ ███╗   ███╗███╗   ███╗
+    echo   ██╔══██╗████╗ ████║████╗ ████║
+    echo   ██████╔╝██╔████╔██║██╔████╔██║
+    echo   ██╔═══╝ ██║╚██╔╝██║██║╚██╔╝██║
+    echo   ██║     ██║ ╚═╝ ██║██║ ╚═╝ ██║
+    echo   ╚═╝     ╚═╝     ╚═╝╚═╝     ╚═╝
+    echo.
+    echo   RMM DETECTOR v1.0 - MONITOR MODE
+    echo   Instant popup alerts when someone connects
     echo.
 )
 

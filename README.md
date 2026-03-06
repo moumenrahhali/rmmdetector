@@ -95,13 +95,72 @@ rmm_detector.bat /json
 rmm_detector.bat /output C:\Temp\my_report.txt
 ```
 
+**Notify mode** – show a Windows popup if an active RMM session is detected right now:
+```batch
+rmm_detector.bat /notify
+```
+
+**Monitor mode** – run continuously and show an **instant popup** the moment someone connects:
+```batch
+rmm_detector.bat /monitor
+rmm_detector.bat /monitor /interval 5
+```
+
 **Run PowerShell directly:**
 ```powershell
 .\detector.ps1
 .\detector.ps1 -Silent
 .\detector.ps1 -Json
 .\detector.ps1 -OutputFile "C:\Temp\report.txt"
+.\detector.ps1 -Notify
+.\detector.ps1 -Monitor
+.\detector.ps1 -Monitor -MonitorInterval 5
 ```
+
+### Windows Notification Popup
+
+RMM Detector can alert you with a **Windows notification popup** when RMM activity is detected.
+
+#### One-time scan with notification (`-Notify` / `/notify`)
+
+After a full scan, if any active (ESTABLISHED) RMM network connections are found—meaning someone
+is actively watching your screen **right now**—a popup appears immediately:
+
+```
+┌──────────────────────────────────────────────┐
+│ ⚠ RMM ALERT: Active Connection Detected!     │
+│                                              │
+│ Someone is actively connected via RMM on     │
+│ WORKSTATION-01.                              │
+│ Port 5938 (TeamViewer) -> 203.0.113.5        │
+└──────────────────────────────────────────────┘
+```
+
+If RMM software is installed but there is no live session, a lower-priority informational popup
+is shown instead.
+
+#### Continuous monitor mode (`-Monitor` / `/monitor`)
+
+Run the monitor in the background and get notified **the instant** a new RMM connection is
+established—without needing to run a manual scan:
+
+```powershell
+.\detector.ps1 -Monitor              # check every 10 seconds (default)
+.\detector.ps1 -Monitor -MonitorInterval 5   # check every 5 seconds
+```
+
+```batch
+rmm_detector.bat /monitor
+rmm_detector.bat /monitor /interval 5
+```
+
+The tool polls for ESTABLISHED TCP connections on known RMM ports. When a new connection
+appears, a Windows Toast notification (or system-tray balloon tip on older Windows) fires
+immediately. The console also logs connection-established and connection-dropped events with
+timestamps. Press **Ctrl+C** to stop monitoring.
+
+> **Tip:** You can run monitor mode minimized or from a scheduled task at login so it runs
+> silently in the background. Pair with `/silent` to suppress all console output.
 
 ### Detection Methods
 
@@ -114,6 +173,7 @@ rmm_detector.bat /output C:\Temp\my_report.txt
 | **Scheduled Tasks** | Enumerates tasks for known RMM keywords |
 | **Network Connections** | Flags active connections on known RMM ports (5938, 7070, 21116, etc.) |
 | **File System** | Checks Program Files and ProgramData for known installation directories |
+| **Active Session Monitor** | Continuously watches for ESTABLISHED RMM connections and fires instant popups |
 
 ### Detected Software (Windows)
 
