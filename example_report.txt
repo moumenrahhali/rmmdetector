@@ -1,0 +1,68 @@
+====================================================
+  RMM DETECTOR SECURITY SCAN REPORT
+====================================================
+Scan Time : 2024-01-15 14:32:07
+Computer  : WORKSTATION-01
+User      : jsmith
+
+RUNNING PROCESSES (2 found):
+  [FOUND] TeamViewer.exe
+  [FOUND] NinjaRMMAgent.exe
+
+INSTALLED SOFTWARE (1 found):
+  [FOUND] ConnectWise Control (ScreenConnect) 23.4.1
+
+SERVICES (2 found):
+  [FOUND] TeamViewer (TeamViewer14) - Status: Running
+  [FOUND] Mesh Agent (MeshAgent) - Status: Running
+
+SCHEDULED TASKS (1 found):
+  [FOUND] \NinjaRMM\NinjaRMMAgent_Update
+
+NETWORK CONNECTIONS (1 found):
+  [FOUND] Port 5938 (TeamViewer) -> 185.70.35.85 [Established]
+
+INSTALLATION DIRECTORIES (3 found):
+  [FOUND] C:\Program Files\TeamViewer
+  [FOUND] C:\Program Files (x86)\ScreenConnect Client (abc123def456)
+  [FOUND] C:\ProgramData\NinjaRMM
+
+------------------------------------------------------------
+SUMMARY: 10 finding(s) detected.
+WARNING: Verify whether these tools were installed by your IT provider.
+         Unauthorized RMM software may indicate a compromised system.
+------------------------------------------------------------
+
+
+RECOMMENDATIONS:
+----------------
+1. Confirm each detected tool was installed by an authorized IT provider.
+2. If any tool is UNKNOWN or UNEXPECTED:
+   - Disconnect from the network immediately.
+   - Contact your IT security team.
+   - Do NOT attempt to remove the software without guidance.
+3. Unauthorized RMM tools may indicate:
+   - A compromised system (attacker-installed backdoor)
+   - A rogue employee monitoring your machine
+   - A previous IT provider that still has access
+4. Document all findings before taking action.
+
+
+ABOUT RMM SOFTWARE:
+-------------------
+Remote Monitoring & Management (RMM) tools are commonly used by IT
+Managed Service Providers (MSPs) to remotely manage and monitor client
+systems. Legitimate uses include:
+  - Patch management and software updates
+  - Remote troubleshooting and support
+  - System health monitoring
+  - Security scanning
+
+However, attackers increasingly abuse these legitimate tools to:
+  - Establish persistent remote access to compromised systems
+  - Bypass endpoint security (tools are trusted/signed)
+  - Move laterally across networks
+  - Exfiltrate data while appearing as normal IT traffic
+
+If you did not authorize the installation of remote management software,
+treat any detected tool as a potential security incident.
